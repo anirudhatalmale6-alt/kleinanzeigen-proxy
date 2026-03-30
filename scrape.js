@@ -1,35 +1,74 @@
 /**
- * Standalone scraper that fetches Kleinanzeigen ads and updates a GitHub Gist.
+ * Standalone scraper that fetches Kleinanzeigen ads.
+ * Loads categories from the live app's admin API so any changes
+ * in the admin panel are automatically picked up.
  * Runs via GitHub Actions cron every 15 minutes.
  */
 
 const cheerio = require('cheerio');
 
-const CATEGORIES = [
+const APP_URL = process.env.APP_URL || 'https://search-console-two.vercel.app';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
+
+// Kleinanzeigen section mappings (same as in the app)
+const SECTIONS = {
+  'alle':              { slug: '',                    code: '' },
+  'dienstleistungen':  { slug: 's-dienstleistungen',  code: 'c297' },
+  'haus-garten':       { slug: 's-haus-garten',       code: 'c80'  },
+  'elektronik':        { slug: 's-elektronik',         code: 'c161' },
+  'auto-rad-boot':     { slug: 's-autos',             code: 'c216' },
+  'immobilien':        { slug: 's-immobilien',         code: 'c195' },
+  'jobs':              { slug: 's-jobs',               code: 'c102' },
+  'familie-kind-baby': { slug: 's-familie-kind-baby',  code: 'c17'  },
+  'freizeit-nachbarschaft': { slug: 's-freizeit-nachbarschaft', code: 'c185' },
+  'heimwerken':        { slug: 's-heimwerken',         code: 'c88'  },
+  'musik-film-buecher':{ slug: 's-musik-film-buecher', code: 'c73'  },
+  'mode-beauty':       { slug: 's-mode-beauty',        code: 'c153' },
+  'haustiere':         { slug: 's-haustiere',          code: 'c130' },
+  'unterricht-kurse':  { slug: 's-unterricht-kurse',   code: 'c33'  },
+  'verschenken':       { slug: 's-zu-verschenken',     code: 'c272' },
+};
+
+const SECTION_CATEGORY_CODES = {
+  'auto-rad-boot':     ['216','210','223','211','222','224'],
+  'immobilien':        ['195','196','197','198','199'],
+  'jobs':              ['102','103','104','105','106','107'],
+  'haustiere':         ['130','131','132','133','134'],
+  'familie-kind-baby': ['17','18','19','20','21','22'],
+  'elektronik':        ['161','162','163','164','165','166','167','168'],
+  'mode-beauty':       ['153','154','155','156','157'],
+  'musik-film-buecher':['73','74','75','76','77'],
+  'heimwerken':        ['88','89','90','91'],
+  'freizeit-nachbarschaft': ['185','186','187','188'],
+  'dienstleistungen':  ['297','298','299','300','301'],
+  'haus-garten':       ['80','81','82','83','84','85','86','87'],
+  'unterricht-kurse':  ['33','34','35'],
+  'verschenken':       ['272'],
+};
+
+// Fallback categories if API is unreachable
+const FALLBACK_CATEGORIES = [
   {
-    id: 'klimaanlagen',
-    name: 'Klimaanlagen',
+    id: 'klimaanlagen', name: 'Klimaanlagen',
     keywords: ['Klimaanlage', 'Split Klimaanlage', 'Klimaanlage Montage', 'Klimaanlage Installation'],
-    location: '46286',
-    radius: 50,
-    section: '',
-    sectionCode: '',
-    searchType: 'anbieter:privat',
-    offerType: 'anzeige:gesuche',
-    excludeSections: { 'auto-rad-boot': ['216','210','223','211','222','224'] },
-    excludeTerms: ['Praktikant', 'Verstärkung', 'Festanstellung'],
+    location: '46286', radius: 100,
+    kleinanzeigenSection: 'alle', searchType: 'anbieter:privat', offerType: '',
+    excludeSections: ['auto-rad-boot', 'immobilien', 'dienstleistungen', 'haus-garten', 'elektronik'],
+    excludeTerms: ['Golf', 'Verkauf', 'quick', 'guter Zustand', 'Praktikant', 'Verstärkung', 'Festanstellung'],
+    enabled: true,
   }
 ];
 
-function buildUrl(keyword, location, radius, section, sectionCode, searchType, offerType) {
+function buildUrl(keyword, location, radius, sectionKey, searchType, offerType) {
   const encoded = encodeURIComponent(keyword);
+  const sectionInfo = SECTIONS[sectionKey] || { slug: '', code: '' };
   const parts = ['https://www.kleinanzeigen.de'];
-  parts.push(section || 's');
+  parts.push(sectionInfo.slug || 's');
   parts.push(location);
   if (searchType) parts.push(searchType);
   if (offerType) parts.push(offerType);
   parts.push(encoded);
-  parts.push(`k0${sectionCode}l1758r${radius}`);
+  parts.push(`k0${sectionInfo.code}l1758r${radius}`);
   return parts.join('/');
 }
 
@@ -66,8 +105,8 @@ function parseAds($, categoryName) {
   return ads;
 }
 
-async function fetchKeyword(keyword, loc, radius, catName, section, sectionCode, searchType, offerType) {
-  const url = buildUrl(keyword, loc, radius, section, sectionCode, searchType, offerType);
+async function fetchKeyword(keyword, loc, radius, catName, sectionKey, searchType, offerType) {
+  const url = buildUrl(keyword, loc, radius, sectionKey, searchType, offerType);
   console.log(`  Fetching: ${url}`);
   try {
     const res = await fetch(url, {
@@ -90,9 +129,9 @@ async function fetchKeyword(keyword, loc, radius, catName, section, sectionCode,
 }
 
 async function scrapeCategory(cat) {
-  console.log(`Scraping: ${cat.name}`);
+  console.log(`Scraping: ${cat.name} (${cat.keywords.length} keywords, ${cat.radius}km)`);
   const promises = cat.keywords.map(kw =>
-    fetchKeyword(kw, cat.location, cat.radius, cat.name, cat.section, cat.sectionCode, cat.searchType, cat.offerType)
+    fetchKeyword(kw, cat.location, cat.radius, cat.name, cat.kleinanzeigenSection || 'alle', cat.searchType, cat.offerType)
   );
   const results = await Promise.all(promises);
   let allAds = results.flat();
@@ -108,17 +147,19 @@ async function scrapeCategory(cat) {
     return isNaN(km) || km <= cat.radius;
   });
 
-  // Filter excluded sections
-  const excludedCodes = Object.values(cat.excludeSections).flat();
-  if (excludedCodes.length > 0) {
-    allAds = allAds.filter(ad => {
-      const match = ad.link.match(/\/(\d+)-(\d+)-(\d+)$/);
-      return !match || !excludedCodes.includes(match[2]);
-    });
+  // Filter excluded sections by category codes in ad URLs
+  if (cat.excludeSections && cat.excludeSections.length > 0) {
+    const excludedCodes = cat.excludeSections.flatMap(s => SECTION_CATEGORY_CODES[s] || []);
+    if (excludedCodes.length > 0) {
+      allAds = allAds.filter(ad => {
+        const match = ad.link.match(/\/(\d+)-(\d+)-(\d+)$/);
+        return !match || !excludedCodes.includes(match[2]);
+      });
+    }
   }
 
   // Filter exclude terms
-  if (cat.excludeTerms.length > 0) {
+  if (cat.excludeTerms && cat.excludeTerms.length > 0) {
     const lower = cat.excludeTerms.map(t => t.toLowerCase());
     allAds = allAds.filter(ad => {
       const lt = ad.title.toLowerCase(), ld = ad.description.toLowerCase();
@@ -130,6 +171,29 @@ async function scrapeCategory(cat) {
   return allAds;
 }
 
+async function loadCategoriesFromApp() {
+  try {
+    console.log(`Loading categories from ${APP_URL}/api/admin/categories`);
+    const res = await fetch(`${APP_URL}/api/admin/categories`, {
+      headers: { 'Authorization': `Bearer ${ADMIN_PASSWORD}` },
+    });
+    if (!res.ok) {
+      console.error(`Admin API returned ${res.status}`);
+      return null;
+    }
+    const data = await res.json();
+    if (data.categories && Array.isArray(data.categories)) {
+      const enabled = data.categories.filter(c => c.enabled !== false);
+      console.log(`Loaded ${enabled.length} enabled categories from app`);
+      return enabled;
+    }
+    return null;
+  } catch (err) {
+    console.error(`Failed to load from app: ${err.message}`);
+    return null;
+  }
+}
+
 async function saveResults(data) {
   const fs = require('fs');
   const path = require('path');
@@ -139,38 +203,12 @@ async function saveResults(data) {
 }
 
 async function main() {
-  // Also load categories from Redis if REDIS_URL is set
-  let categories = CATEGORIES;
+  // Load categories from the live app (picks up admin changes automatically)
+  let categories = await loadCategoriesFromApp();
 
-  // Try to load custom categories from Redis
-  if (process.env.REDIS_URL) {
-    try {
-      const Redis = require('ioredis');
-      const redis = new Redis(process.env.REDIS_URL, { connectTimeout: 5000, commandTimeout: 5000 });
-      const raw = await redis.get('kleinanzeigen:categories');
-      redis.disconnect();
-      if (raw) {
-        const stored = JSON.parse(raw);
-        if (Array.isArray(stored) && stored.length > 0) {
-          categories = stored.filter(c => c.enabled !== false).map(c => ({
-            id: c.id,
-            name: c.name,
-            keywords: c.keywords,
-            location: c.location || '46286',
-            radius: c.radius || 50,
-            section: '',
-            sectionCode: '',
-            searchType: c.searchType || '',
-            offerType: c.offerType || '',
-            excludeSections: {},
-            excludeTerms: c.excludeTerms || [],
-          }));
-          console.log(`Loaded ${categories.length} categories from Redis`);
-        }
-      }
-    } catch (err) {
-      console.error('Redis load failed, using defaults:', err.message);
-    }
+  if (!categories || categories.length === 0) {
+    console.log('Using fallback categories');
+    categories = FALLBACK_CATEGORIES;
   }
 
   const result = { timestamp: new Date().toISOString(), categories: [] };
