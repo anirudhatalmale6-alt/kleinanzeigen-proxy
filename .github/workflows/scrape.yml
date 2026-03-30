@@ -1,0 +1,36 @@
+name: Scrape Kleinanzeigen
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install cheerio
+
+      - name: Run scraper
+        run: node scrape.js
+        env:
+          SCRAPE_TO_FILE: 'true'
+
+      - name: Commit results
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add ads.json
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update ads cache $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            git push
+          fi
